@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 import transformers
 from transformers import GPT2Config, LogitsProcessorList
+from transformers.cache_utils import DynamicCache
 from indextts.gpt.transformers_gpt2 import GPT2PreTrainedModel, GPT2Model
 
 # from transformers import GPT2Config, GPT2PreTrainedModel, LogitsProcessorList
@@ -89,8 +90,14 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
         token_type_ids = kwargs.get("token_type_ids", None)  # usually None
+
+        if past_key_values is None and "past_key_values" in kwargs:
+            past_key_values = kwargs["past_key_values"]
+
         if not self.kv_cache:
             past_key_values = None
+        elif past_key_values is not None and isinstance(past_key_values, tuple):
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
         # only last token for inputs_ids if past is defined in kwargs
         if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
@@ -108,10 +115,14 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
                 position_ids = position_ids[:, -1].unsqueeze(-1)
         else:
             position_ids = None
+        use_cache = kwargs.get("use_cache")
+        if use_cache is None:
+            use_cache = self.kv_cache
+
         return {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
-            "use_cache": kwargs.get("use_cache"),
+            "use_cache": use_cache,
             "position_ids": position_ids,
             "attention_mask": attention_mask,
             "token_type_ids": token_type_ids,
@@ -430,6 +441,14 @@ class UnifiedVoice(nn.Module):
 
         # self.inference_model = PrunedGPT2InferenceModel(gpt_config, self.gpt, self.mel_pos_embedding, self.mel_embedding, self.final_norm, self.mel_head)
         self.gpt.wte = self.mel_embedding
+
+        try:
+            generation_config = self.inference_model.generation_config
+            generation_config.use_cache = True
+            generation_config.return_legacy_cache = False
+            generation_config.cache_implementation = "dynamic"
+        except AttributeError:
+            pass
 
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
         inp = F.pad(input, (1, 0), value=start_token)
