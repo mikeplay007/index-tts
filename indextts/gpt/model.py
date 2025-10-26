@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import transformers
 from transformers import GPT2Config, LogitsProcessorList
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import DynamicCache
 from indextts.gpt.transformers_gpt2 import GPT2PreTrainedModel, GPT2Model
 
 # from transformers import GPT2Config, GPT2PreTrainedModel, LogitsProcessorList
@@ -101,6 +102,8 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             elif isinstance(past_key_values, Cache):
                 past_key_values = past_key_values
+        elif past_key_values is not None and isinstance(past_key_values, tuple):
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
         # only last token for inputs_ids if past is defined in kwargs
         if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
