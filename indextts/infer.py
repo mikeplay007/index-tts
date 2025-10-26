@@ -26,8 +26,13 @@ from indextts.utils.front import TextNormalizer, TextTokenizer
 
 class IndexTTS:
     def __init__(
-            self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=True, device=None,
+            self,
+            cfg_path="checkpoints/config.yaml",
+            model_dir="checkpoints",
+            use_fp16=True,
+            device=None,
             use_cuda_kernel=None,
+            compile_gpt=True,
     ):
         """
         Args:
@@ -36,6 +41,9 @@ class IndexTTS:
             use_fp16 (bool): whether to use fp16.
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
+            compile_gpt (bool): whether to compile the GPT inference graph with ``torch.compile``
+                (only effective on CUDA devices). Can also be toggled with the
+                ``INDEXTTS_COMPILE_GPT`` environment variable.
         """
         if device is not None:
             self.device = device
@@ -63,6 +71,16 @@ class IndexTTS:
         self.model_dir = model_dir
         self.dtype = torch.float16 if self.use_fp16 else None
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
+        env_compile_flag = os.getenv("INDEXTTS_COMPILE_GPT", None)
+        if env_compile_flag is not None:
+            compile_gpt = env_compile_flag.lower() not in {"0", "false", "no"}
+        self._compile_gpt = (
+            compile_gpt
+            and hasattr(torch, "compile")
+            and isinstance(self.device, str)
+            and self.device.startswith("cuda")
+        )
+        self._compiled_gpt = False
 
         # Comment-off to load the VQ-VAE model for debugging tokenizer
         #   https://github.com/index-tts/index-tts/issues/34
@@ -96,8 +114,12 @@ class IndexTTS:
                 print(f">> DeepSpeed加载失败，回退到标准推理: {e}")
 
             self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=True)
+            if self._compile_gpt and not use_deepspeed:
+                self._maybe_compile_gpt()
         else:
-            self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=False, half=False)
+            self.gpt.post_init_gpt2_config(use_deepspeed=False, kv_cache=True, half=False)
+            if self._compile_gpt:
+                self._maybe_compile_gpt()
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
@@ -130,6 +152,19 @@ class IndexTTS:
         # 进度引用显示（可选）
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
+
+    def _maybe_compile_gpt(self):
+        """Compile the GPT inference model to reduce Python overhead during decoding."""
+        if not hasattr(torch, "compile"):
+            return
+        try:
+            mode = "reduce-overhead"
+            self.gpt.inference_model = torch.compile(self.gpt.inference_model, mode=mode).eval()
+            self._compiled_gpt = True
+            print(f">> torch.compile enabled for GPT inference (mode={mode})")
+        except Exception as exc:
+            self._compiled_gpt = False
+            print(f">> torch.compile failed, falling back to eager execution: {exc}")
 
     def remove_long_silence(self, codes: torch.Tensor, silent_token=52, max_consecutive=30):
         """
