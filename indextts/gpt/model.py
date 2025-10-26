@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 import transformers
 from transformers import GPT2Config, LogitsProcessorList
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.cache_utils import DynamicCache
 from indextts.gpt.transformers_gpt2 import GPT2PreTrainedModel, GPT2Model
 
@@ -96,6 +97,11 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 
         if not self.kv_cache:
             past_key_values = None
+        elif past_key_values is not None:
+            if isinstance(past_key_values, tuple):
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            elif isinstance(past_key_values, Cache):
+                past_key_values = past_key_values
         elif past_key_values is not None and isinstance(past_key_values, tuple):
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
         # only last token for inputs_ids if past is defined in kwargs
@@ -183,7 +189,23 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        hidden_states = transformer_outputs[0]
+        if isinstance(transformer_outputs, tuple):
+            hidden_states = transformer_outputs[0]
+            transformer_past = transformer_outputs[1] if len(transformer_outputs) > 1 else None
+            tuple_remaining_outputs = transformer_outputs[2:]
+            hidden_states_attr = None
+            attentions_attr = None
+            cross_attentions_attr = None
+        else:
+            hidden_states = transformer_outputs[0]
+            transformer_past = transformer_outputs.past_key_values
+            tuple_remaining_outputs = ()
+            hidden_states_attr = transformer_outputs.hidden_states
+            attentions_attr = transformer_outputs.attentions
+            cross_attentions_attr = transformer_outputs.cross_attentions
+
+        if self.kv_cache and transformer_past is not None and isinstance(transformer_past, tuple):
+            transformer_past = DynamicCache.from_legacy_cache(transformer_past)
 
         # Set device for model parallelism
         if self.model_parallel:
@@ -196,15 +218,24 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         lm_logits = self.lm_head(hidden_states)
 
         if not return_dict:
-            return (lm_logits,) + transformer_outputs[1:]
+            outputs = (lm_logits, transformer_past)
+            if isinstance(transformer_outputs, tuple):
+                outputs = outputs + tuple_remaining_outputs
+            else:
+                outputs = outputs + (
+                    hidden_states_attr,
+                    attentions_attr,
+                    cross_attentions_attr,
+                )
+            return outputs
 
         return CausalLMOutputWithCrossAttentions(
             loss=None,
             logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
+            past_key_values=transformer_past,
+            hidden_states=hidden_states_attr,
+            attentions=attentions_attr,
+            cross_attentions=cross_attentions_attr,
         )
 
     @staticmethod
@@ -214,6 +245,16 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         :meth:`~transformers.PreTrainedModel.beam_search` or :meth:`~transformers.PreTrainedModel.beam_sample` is
         called. This is required to match :obj:`past_key_values` with the correct beam_idx at every generation step.
         """
+        if past is None:
+            return past
+
+        if isinstance(past, Cache):
+            if hasattr(past, "index_select"):
+                return past.index_select(beam_idx)
+            if hasattr(past, "batch_select"):
+                return past.batch_select(beam_idx)
+            return past
+
         return tuple(
             tuple(
                 past_state.index_select(0, beam_idx.to(past_state.device))

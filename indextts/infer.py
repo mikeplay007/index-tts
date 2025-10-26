@@ -33,6 +33,7 @@ class IndexTTS:
             device=None,
             use_cuda_kernel=None,
             compile_gpt=True,
+            enable_tf32=True,
     ):
         """
         Args:
@@ -44,6 +45,9 @@ class IndexTTS:
             compile_gpt (bool): whether to compile the GPT inference graph with ``torch.compile``
                 (only effective on CUDA devices). Can also be toggled with the
                 ``INDEXTTS_COMPILE_GPT`` environment variable.
+            enable_tf32 (bool): whether to allow TF32 matrix multiply kernels on
+                Ampere+ GPUs. Can also be toggled with the ``INDEXTTS_ENABLE_TF32``
+                environment variable.
         """
         if device is not None:
             self.device = device
@@ -81,6 +85,21 @@ class IndexTTS:
             and self.device.startswith("cuda")
         )
         self._compiled_gpt = False
+
+        env_tf32_flag = os.getenv("INDEXTTS_ENABLE_TF32", None)
+        if env_tf32_flag is not None:
+            enable_tf32 = env_tf32_flag.lower() not in {"0", "false", "no"}
+        has_cuda_backend = hasattr(torch.backends, "cuda")
+        self._enable_tf32 = enable_tf32 and torch.cuda.is_available() and has_cuda_backend
+        if self._enable_tf32:
+            matmul_backend = getattr(torch.backends.cuda, "matmul", None)
+            if matmul_backend is not None:
+                matmul_backend.allow_tf32 = True
+            cudnn_backend = getattr(torch.backends.cuda, "cudnn", None)
+            if cudnn_backend is not None:
+                cudnn_backend.allow_tf32 = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
 
         # Comment-off to load the VQ-VAE model for debugging tokenizer
         #   https://github.com/index-tts/index-tts/issues/34
